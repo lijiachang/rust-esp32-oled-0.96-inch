@@ -6,8 +6,8 @@
 * Crypto Price display (BTC/ETH/SOL)
 
 ![IMG_20240810_101439.jpeg](IMG_20240810_101439.jpeg)
-![IMG_20240810_101508.jpg](IMG_20240810_101508.jpg)
 ![IMG_20240810_121609.jpg](IMG_20240810_121609.jpg)
+![IMG_20240810_101508.jpg](IMG_20240810_101508.jpg)
 
 # build and flash and monitor
 
