@@ -1,5 +1,5 @@
 use embedded_graphics::Drawable;
-use embedded_graphics::geometry::{Point, Size};
+use embedded_graphics::geometry::Point;
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -8,8 +8,7 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::prelude::*;
 use ssd1306::{I2CDisplayInterface, rotation::DisplayRotation, size::DisplaySize128x64, Ssd1306};
-use ssd1306::mode::{BufferedGraphicsMode, DisplayConfig};
-use ssd1306::prelude::I2CInterface;
+use ssd1306::mode::DisplayConfig;
 
 fn main() {
     // It is necessary to call this function once. Otherwise some patches to the runtime

@@ -95,6 +95,9 @@ I (416) rust_esp32_oled_0_96_inch: Hello, world!
 ```
 
 ## wifi
+export WIFI_SSID=your_wifi_ssid
+export WIFI_PASS=your_wifi_password
+
 cargo build --release &&espflash flash -p /dev/ttyUSB0 target/xtensa-esp32-espidf/release/wifi --monitor
 
 ```text
