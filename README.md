@@ -241,7 +241,7 @@ I (5208) main_task: Returned from app_main()
 
 ```
 
-## wifi
+## Crypto Price display (BTC/ETH/SOL)
 export WIFI_SSID=your_wifi_ssid
 export WIFI_PASS=your_wifi_password
 
