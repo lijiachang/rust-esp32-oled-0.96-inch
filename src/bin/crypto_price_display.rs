@@ -6,7 +6,7 @@ use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWif
 use embedded_svc::http::client::Client;
 use embedded_svc::utils::io::try_read_full;
 use esp_idf_svc::http::client::EspHttpConnection;
-use log::info;
+use log::{info, error, warn};
 use chrono::{DateTime, FixedOffset};
 use esp_idf_svc::http::client::Configuration as HttpConfig;
 // oled display
@@ -24,9 +24,11 @@ use embedded_graphics::{
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::prelude::*;
 use serde::Deserialize;
+use std::time::Duration;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
+const REQUEST_TIMEOUT: u64 = 10; // 10 seconds timeout
 
 /// "Sat, 10 Aug 2024 03:14:05 GMT" -> 2024-08-10 11:14:05
 fn parse_and_format_time(date_str: &str) -> Result<String, chrono::ParseError> {
@@ -40,7 +42,6 @@ fn parse_and_format_time(date_str: &str) -> Result<String, chrono::ParseError> {
     // 格式化输出
     Ok(china_time.format("%Y-%m-%d %H:%M:%S").to_string())
 }
-
 
 #[derive(Deserialize)]
 struct TickerPrice {
@@ -59,17 +60,48 @@ fn main() {
 
     info!("Hello, world!");
 
-    let peripherals = Peripherals::take().unwrap();
-    let sysloop = EspSystemEventLoop::take().unwrap();
-    let nvs = EspDefaultNvsPartition::take().unwrap();
+    let peripherals = match Peripherals::take() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to take peripherals: {:?}", e);
+            return;
+        }
+    };
 
-    let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs)).unwrap(),
-        sysloop,
-    ).unwrap();
+    let sysloop = match EspSystemEventLoop::take() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to take system event loop: {:?}", e);
+            return;
+        }
+    };
+
+    let nvs = match EspDefaultNvsPartition::take() {
+        Ok(n) => n,
+        Err(e) => {
+            error!("Failed to take NVS partition: {:?}", e);
+            return;
+        }
+    };
+
+    let wifi_driver = match EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs)) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create WiFi driver: {:?}", e);
+            return;
+        }
+    };
+
+    let mut wifi = match BlockingWifi::wrap(wifi_driver, sysloop) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create blocking WiFi: {:?}", e);
+            return;
+        }
+    };
 
     info!("配置WiFi");
-    wifi.set_configuration(
+    if let Err(e) = wifi.set_configuration(
         &Configuration::Client(ClientConfiguration {
             ssid: SSID.try_into().unwrap(),
             bssid: None,
@@ -78,48 +110,74 @@ fn main() {
             channel: None,
             scan_method: Default::default(),
             pmf_cfg: Default::default(),
-        },
-        )
-    ).expect("set_configuration: panic");
+        })
+    ) {
+        error!("Failed to configure WiFi: {:?}", e);
+        return;
+    }
 
     info!("启动WiFi");
-    wifi.start().unwrap();
+    if let Err(e) = wifi.start() {
+        error!("Failed to start WiFi: {:?}", e);
+        return;
+    }
 
     info!("连接WiFi");
-    wifi.connect().unwrap();
+    if let Err(e) = wifi.connect() {
+        error!("Failed to connect to WiFi: {:?}", e);
+        return;
+    }
 
     info!("等待底层网络接口启动");
-    wifi.wait_netif_up().unwrap();
+    if let Err(e) = wifi.wait_netif_up() {
+        error!("Network interface failed to come up: {:?}", e);
+        return;
+    }
 
     info!(
         "获取到IP地址为:{:?}",
         wifi.wifi().sta_netif().get_ip_info()
     );
 
-    // Create HTTPS Connection Handle
-    let httpconnection = EspHttpConnection::new(&HttpConfig {
+    // Create HTTPS Connection Handle with timeout
+    let httpconnection = match EspHttpConnection::new(&HttpConfig {
         use_global_ca_store: true,
         crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
+        timeout: Some(Duration::from_secs(REQUEST_TIMEOUT)),
         ..Default::default()
-    }).unwrap();
+    }) {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to create HTTP connection: {:?}", e);
+            return;
+        }
+    };
 
     let mut client = Client::wrap(httpconnection);
     let url = "https://api.binance.com/api/v3/ticker/price?symbols=[%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22]";
 
-    // oled
+    // oled setup
     let i2c = peripherals.i2c0;
     let sda = peripherals.pins.gpio5;
     let scl = peripherals.pins.gpio4;
 
     let config = I2cConfig::new().baudrate(100.kHz().into());
-    let i2c: I2cDriver<'static> = I2cDriver::new(i2c, sda, scl, &config).expect("i2c error:");
+    let i2c = match I2cDriver::new(i2c, sda, scl, &config) {
+        Ok(i2c) => i2c,
+        Err(e) => {
+            error!("I2C error: {:?}", e);
+            return;
+        }
+    };
 
     let interface = I2CDisplayInterface::new(i2c);
-
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
 
-    let _ = display.init();
+    if let Err(e) = display.init() {
+        error!("Failed to initialize display: {:?}", e);
+        return;
+    }
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -132,65 +190,141 @@ fn main() {
         .build();
 
     loop {
-        // GET
-        let mut resp = client.get(url).unwrap().submit().unwrap();
-        info!("响应状态：{}", resp.status());
+        // GET with error handling
+        let mut resp = match client.get(url) {
+            Ok(req) => match req.submit() {
+                Ok(resp) => {
+                    info!("响应状态：{}", resp.status());
+                    resp
+                },
+                Err(e) => {
+                    error!("Failed to submit request: {:?}", e);
+                    // Clear display and show error
+                    display.clear_buffer();
+                    Text::with_baseline(
+                        "Network error",
+                        Point::new(0, 0),
+                        date_style,
+                        Baseline::Top,
+                    )
+                        .draw(&mut display)
+                        .ok();
+                    display.flush().ok();
+                    FreeRtos::delay_ms(5000); // Wait 5 seconds before retrying
+                    continue;
+                }
+            },
+            Err(e) => {
+                error!("Failed to create request: {:?}", e);
+                FreeRtos::delay_ms(5000);
+                continue;
+            }
+        };
 
         let (_headers, mut body) = resp.split();
-        let mut buf = [0_u8; 2048]; // 增加缓冲区大小以适应更多数据
-        let br = try_read_full(&mut body, &mut buf).unwrap();
-        let body = std::str::from_utf8(&buf[0..br]).unwrap();
+        let mut buf = [0_u8; 2048];
+
+        let br = match try_read_full(&mut body, &mut buf) {
+            Ok(br) => br,
+            Err(e) => {
+                error!("Failed to read response body: {:?}", e);
+                FreeRtos::delay_ms(1000);
+                continue;
+            }
+        };
+
+        let body = match std::str::from_utf8(&buf[0..br]) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Invalid UTF-8 in response: {:?}", e);
+                FreeRtos::delay_ms(1000);
+                continue;
+            }
+        };
+
         info!("响应内容：{body}");
 
-        // Parse JSON
+        // Clear display for new data
+        display.clear_buffer();
+
+        // Parse JSON and update display
         match serde_json::from_str::<Vec<TickerPrice>>(body) {
             Ok(tickers) => {
-                display.clear_buffer();
-
-                // 提取时间展示
-                let date = resp.header("date");
-                Text::with_baseline(
-                    &parse_and_format_time(date.unwrap()).unwrap(),
-                    Point::new(0, 0),
-                    date_style,
-                    Baseline::Top,
-                )
-                    .draw(&mut display)
-                    .unwrap();
+                // Extract and display time
+                if let Some(date_str) = resp.header("date") {
+                    match parse_and_format_time(date_str) {
+                        Ok(formatted_time) => {
+                            Text::with_baseline(
+                                &formatted_time,
+                                Point::new(0, 0),
+                                date_style,
+                                Baseline::Top,
+                            )
+                                .draw(&mut display)
+                                .ok();
+                        },
+                        Err(e) => {
+                            warn!("Failed to parse date: {:?}", e);
+                            // Still show something as date
+                            Text::with_baseline(
+                                "Time error",
+                                Point::new(0, 0),
+                                date_style,
+                                Baseline::Top,
+                            )
+                                .draw(&mut display)
+                                .ok();
+                        }
+                    }
+                }
 
                 let mut y_offset = 18;
 
                 for (index, ticker) in tickers.iter().enumerate() {
                     let symbol = ticker.symbol.replace("USDT", "");
-                    if let Ok(price_float) = ticker.price.parse::<f64>() {
-                        let formatted_price = format!("{} {:.2}", symbol, price_float);
+                    match ticker.price.parse::<f64>() {
+                        Ok(price_float) => {
+                            let formatted_price = format!("{} {:.2}", symbol, price_float);
 
-                        Text::with_baseline(
-                            &formatted_price,
-                            Point::new(10, y_offset),
-                            text_style,
-                            Baseline::Top,
-                        )
-                            .draw(&mut display)
-                            .unwrap();
+                            Text::with_baseline(
+                                &formatted_price,
+                                Point::new(10, y_offset),
+                                text_style,
+                                Baseline::Top,
+                            )
+                                .draw(&mut display)
+                                .ok();
 
-                        y_offset += 16; // 增加y偏移以显示下一行
-
-                        info!("Displayed: {}", formatted_price);
-                    } else {
-                        info!("Failed to parse price for {}", symbol);
+                            y_offset += 16;
+                            info!("Displayed: {}", formatted_price);
+                        },
+                        Err(e) => {
+                            warn!("Failed to parse price for {}: {:?}", symbol, e);
+                        }
                     }
 
                     if index == 3 {
                         break;
                     }
                 }
-
-                let _ = display.flush();
-            }
+            },
             Err(e) => {
-                info!("Failed to parse JSON: {}", e);
+                error!("Failed to parse JSON: {}", e);
+                // Display error on OLED
+                Text::with_baseline(
+                    "JSON Error",
+                    Point::new(10, 20),
+                    text_style,
+                    Baseline::Top,
+                )
+                    .draw(&mut display)
+                    .ok();
             }
+        }
+
+        // Flush display changes but handle errors gracefully
+        if let Err(e) = display.flush() {
+            error!("Display flush error: {:?}", e);
         }
 
         FreeRtos::delay_ms(1000); // sleep 1s
