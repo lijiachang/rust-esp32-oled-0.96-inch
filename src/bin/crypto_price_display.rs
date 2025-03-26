@@ -11,7 +11,7 @@ use chrono::{DateTime, FixedOffset};
 use esp_idf_svc::http::client::Configuration as HttpConfig;
 // oled display
 use embedded_graphics::text::Baseline;
-use ssd1306::mode::DisplayConfig;
+use ssd1306::mode::{BufferedGraphicsMode, DisplayConfig};
 use ssd1306::rotation::DisplayRotation;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
@@ -21,9 +21,15 @@ use embedded_graphics::{
     prelude::*,
     text::Text,
 };
+use embedded_graphics::mono_font::MonoTextStyle;
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::prelude::*;
 use serde::Deserialize;
+// 看门狗
+use esp_idf_sys::esp_restart;
+use ssd1306::prelude::I2CInterface;
+use std::time::Duration;
+use esp_idf_svc::systime::EspSystemTime;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
@@ -59,6 +65,13 @@ fn main() {
 
     info!("Hello, world!");
 
+    // 初始化软件看门狗
+    let sys_time = EspSystemTime {};
+    let mut last_feed_time = sys_time.now().as_millis(); // 获取毫秒时间戳
+    let watchdog_timeout_ms = 60000; // 60秒超时 (60000毫秒)
+
+    info!("初始化软件看门狗，超时时间为60秒");
+
     let peripherals = Peripherals::take().unwrap();
     let sysloop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
@@ -82,11 +95,17 @@ fn main() {
         )
     ).expect("set_configuration: panic");
 
+    // 更新看门狗时间
+    last_feed_time = sys_time.now().as_millis();
+
     info!("启动WiFi");
     wifi.start().unwrap();
 
     info!("连接WiFi");
     wifi.connect().unwrap();
+
+    // 更新看门狗时间
+    last_feed_time = sys_time.now().as_millis();
 
     info!("等待底层网络接口启动");
     wifi.wait_netif_up().unwrap();
@@ -131,32 +150,165 @@ fn main() {
         .text_color(BinaryColor::On)
         .build();
 
+    // 连续错误计数器
+    let mut consecutive_errors = 0;
+    let max_consecutive_errors = 5;
+
+    // 无更新迭代计数器
+    let mut iterations_without_update = 0;
+    let max_iterations_without_update = 300; // 约5分钟（如果循环每秒运行一次）
+
     loop {
-        // GET
-        let mut resp = client.get(url).unwrap().submit().unwrap();
+        // 检查看门狗是否超时
+        let now_ms = sys_time.now().as_millis();
+        if now_ms - last_feed_time > watchdog_timeout_ms {
+            info!("看门狗超时！重启系统...");
+            display.clear_buffer();
+            Text::with_baseline(
+                "看门狗超时，重启中...",
+                Point::new(0, 32),
+                text_style,
+                Baseline::Top,
+            )
+                .draw(&mut display)
+                .unwrap();
+            display.flush().unwrap();
+            FreeRtos::delay_ms(1000);
+
+            // 重启设备
+            unsafe {
+                esp_restart();
+            }
+        }
+
+        // 复位看门狗
+        last_feed_time = now_ms;
+
+        // 检查是否太长时间没有成功更新
+        if iterations_without_update >= max_iterations_without_update {
+            info!("太长时间没有成功更新 ({}次)，准备重启...", iterations_without_update);
+            // 显示重启信息
+            display.clear_buffer();
+            Text::with_baseline(
+                "系统即将重启...",
+                Point::new(0, 32),
+                text_style,
+                Baseline::Top,
+            )
+                .draw(&mut display)
+                .unwrap();
+            display.flush().unwrap();
+
+            FreeRtos::delay_ms(1000);
+
+            // 重启设备
+            unsafe {
+                esp_restart();
+            }
+        }
+
+        info!("获取API数据...");
+
+        // GET请求
+        let resp_result = client.get(url);
+        if let Err(e) = resp_result {
+            info!("HTTP请求创建失败: {:?}", e);
+            consecutive_errors += 1;
+            iterations_without_update += 1;
+
+            // 显示错误消息
+            display_error(&mut display, &format!("HTTP请求错误: {}", consecutive_errors), text_style);
+
+            handle_consecutive_errors(&mut client, &mut consecutive_errors,
+                                      max_consecutive_errors, &mut wifi, &mut display, text_style);
+
+            FreeRtos::delay_ms(1000);
+            continue;
+        }
+
+        let submit_result = resp_result.unwrap().submit();
+        if let Err(e) = submit_result {
+            info!("HTTP请求提交失败: {:?}", e);
+            consecutive_errors += 1;
+            iterations_without_update += 1;
+
+            // 显示错误消息
+            display_error(&mut display, &format!("网络错误: {}", consecutive_errors), text_style);
+
+            handle_consecutive_errors(&mut client, &mut consecutive_errors,
+                                      max_consecutive_errors, &mut wifi, &mut display, text_style);
+
+            FreeRtos::delay_ms(1000);
+            continue;
+        }
+
+        let mut resp = submit_result.unwrap();
         info!("响应状态：{}", resp.status());
 
+        // 获取日期头
+        // let date = resp.header("date");
+
         let (_headers, mut body) = resp.split();
-        let mut buf = [0_u8; 2048]; // 增加缓冲区大小以适应更多数据
-        let br = try_read_full(&mut body, &mut buf).unwrap();
-        let body = std::str::from_utf8(&buf[0..br]).unwrap();
+        let mut buf = [0_u8; 2048];
+
+        // 使用正确的错误处理方式读取响应体
+        let read_result = try_read_full(&mut body, &mut buf);
+        if let Err(e) = read_result {
+            info!("读取响应体失败: {:?}", e);
+            consecutive_errors += 1;
+            iterations_without_update += 1;
+
+            // 显示错误消息
+            display_error(&mut display, &format!("读取响应错误: {}", consecutive_errors), text_style);
+
+            handle_consecutive_errors(&mut client, &mut consecutive_errors,
+                                      max_consecutive_errors, &mut wifi, &mut display, text_style);
+
+            FreeRtos::delay_ms(1000);
+            continue;
+        }
+
+        let br = read_result.unwrap();
+
+        let body_result = std::str::from_utf8(&buf[0..br]);
+        if let Err(e) = body_result {
+            info!("解析响应体为UTF-8失败: {:?}", e);
+            consecutive_errors += 1;
+            iterations_without_update += 1;
+
+            // 显示错误消息
+            display_error(&mut display, "UTF-8解析错误", text_style);
+
+            FreeRtos::delay_ms(1000);
+            continue;
+        }
+
+        let body = body_result.unwrap();
         info!("响应内容：{body}");
 
         // Parse JSON
         match serde_json::from_str::<Vec<TickerPrice>>(body) {
             Ok(tickers) => {
+                // 成功：重置错误计数器
+                consecutive_errors = 0;
+                iterations_without_update = 0;
+
                 display.clear_buffer();
 
                 // 提取时间展示
                 let date = resp.header("date");
-                Text::with_baseline(
-                    &parse_and_format_time(date.unwrap()).unwrap(),
-                    Point::new(0, 0),
-                    date_style,
-                    Baseline::Top,
-                )
-                    .draw(&mut display)
-                    .unwrap();
+                if let Some(date_str) = date {
+                    if let Ok(formatted_time) = parse_and_format_time(date_str) {
+                        Text::with_baseline(
+                            &formatted_time,
+                            Point::new(0, 0),
+                            date_style,
+                            Baseline::Top,
+                        )
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                }
 
                 let mut y_offset = 18;
 
@@ -189,10 +341,87 @@ fn main() {
                 let _ = display.flush();
             }
             Err(e) => {
-                info!("Failed to parse JSON: {}", e);
+                info!("解析JSON失败: {}", e);
+                consecutive_errors += 1;
+                iterations_without_update += 1;
+
+                // 显示错误消息
+                display_error(&mut display, "JSON解析错误", text_style);
             }
         }
 
-        FreeRtos::delay_ms(1000); // sleep 1s
+        FreeRtos::delay_ms(1000); // 睡眠1秒
+    }
+}
+
+// 显示错误消息
+fn display_error(display: &mut Ssd1306<I2CInterface<I2cDriver<'static>>, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>,
+                 message: &str,
+                 style: MonoTextStyle<BinaryColor>) {
+    display.clear_buffer();
+    Text::with_baseline(
+        message,
+        Point::new(0, 32),
+        style,
+        Baseline::Top,
+    )
+        .draw(display)
+        .unwrap();
+    display.flush().unwrap();
+}
+
+// 处理连续错误
+fn handle_consecutive_errors(
+    client: &mut Client<EspHttpConnection>,
+    consecutive_errors: &mut u32,
+    max_consecutive_errors: u32,
+    wifi: &mut BlockingWifi<EspWifi<'static>>,
+    display: &mut Ssd1306<I2CInterface<I2cDriver<'static>>, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>,
+    text_style: MonoTextStyle<BinaryColor>
+) {
+    // 如果连续错误太多，尝试重置连接
+    if *consecutive_errors >= max_consecutive_errors {
+        info!("连续错误过多 ({})，尝试重置连接...", consecutive_errors);
+
+        // 显示重连信息
+        display_error(display, "正在重新连接...", text_style);
+
+        // 重建HTTP连接
+        if let Ok(new_conn) = EspHttpConnection::new(&HttpConfig {
+            use_global_ca_store: true,
+            crt_bundle_attach: Some(esp_idf_sys::esp_crt_bundle_attach),
+            ..Default::default()
+        }) {
+            *client = Client::wrap(new_conn);
+            info!("HTTP客户端已重置");
+
+            // 检查WiFi连接
+            if wifi.is_connected().unwrap_or(false) {
+                info!("WiFi仍然连接");
+            } else {
+                info!("WiFi已断开，尝试重连...");
+                // 完整的WiFi重连序列
+                let _ = wifi.stop();
+                FreeRtos::delay_ms(1000);
+
+                if let Err(e) = wifi.start() {
+                    info!("WiFi启动失败: {:?}", e);
+                } else if let Err(e) = wifi.connect() {
+                    info!("WiFi连接失败: {:?}", e);
+                } else {
+                    info!("WiFi重连成功");
+                    if let Err(e) = wifi.wait_netif_up() {
+                        info!("等待网络接口失败: {:?}", e);
+                    } else {
+                        info!("网络接口已启动");
+                    }
+                }
+            }
+
+            // 重置错误计数器
+            *consecutive_errors = 0;
+        } else {
+            info!("重置HTTP连接失败");
+        }
     }
 }
